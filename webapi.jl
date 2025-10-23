@@ -4,22 +4,39 @@ using UUIDs
 
 instances = isdefined(@__MODULE__, :instances) ? instances : Dict{String, Any}()
 
-serialize_car(car) = Dict(
-    "id"  => car.id,
-    "pos" => [car.pos[1], car.pos[2]],
-    "vel" => [car.vel[1], car.vel[2]],
+# ---- Serialización plana ----
+serialize_light(l::TrafficLight) = Dict(
+    "id"    => l.id,
+    "pos"   => [l.pos[1], l.pos[2]],
+    "dir"   => String(l.dir),
+    "state" => String(light_state(l))
 )
 
-serialize_cars(model) = [serialize_car(car) for car in allagents(model)]
+serialize_vehicle(v::Vehicle) = Dict(
+    "id"  => v.id,
+    "pos" => [v.pos[1], v.pos[2]],
+    "vel" => [v.vel[1], v.vel[2]]
+)
+
+function gather(model)
+    lights = Vector{Any}()
+    cars   = Vector{Any}()
+    for a in allagents(model)
+        if a isa TrafficLight
+            push!(lights, serialize_light(a))
+        elseif a isa Vehicle
+            push!(cars, serialize_vehicle(a))
+        end
+    end
+    return lights, cars
+end
 
 route("/simulations", method = POST) do
     model = initialize_model()
     id = string(uuid1())
     instances[id] = model
-    return json(Dict(
-        "Location" => "/simulations/$id",
-        "cars"     => serialize_cars(model)
-    ))
+    lights, cars = gather(model)
+    json(Dict("Location" => "/simulations/$id", "lights" => lights, "cars" => cars))
 end
 
 route("/simulations/:id") do
@@ -29,7 +46,8 @@ route("/simulations/:id") do
     end
     model = instances[sim_id]
     run!(model, 1)
-    return json(Dict("cars" => serialize_cars(model)))
+    lights, cars = gather(model)
+    json(Dict("lights" => lights, "cars" => cars))
 end
 
 Genie.config.run_as_server = true

@@ -1,69 +1,115 @@
 using Agents, Random
 using StaticArrays: SVector
-using Distributions: Uniform
 
-# Agente continuo; el flag `accelerating` queda por compatibilidad (no lo usamos aquí)
-@agent struct Car(ContinuousAgent{2,Float64})
-    accelerating::Bool = true
+const CYCLE  = 28
+const G_T    = 10
+const Y_T    = 4
+const DT     = 0.4
+const CROSS_HALF = 1.25
+const STOP_MARGIN = 0.2
+
+@agent struct TrafficLight(ContinuousAgent{2,Float64})
+    dir::Symbol
+    tick::Int
 end
 
-# Reglas de cambio de velocidad (componente X)
-accelerate(agent) = agent.vel[1] + 0.05
-decelerate(agent) = agent.vel[1] - 0.1
+@agent struct Vehicle(ContinuousAgent{2,Float64})
+    target_speed::Float64
+end
 
-# Detecta si hay un auto "adelante" en la MISMA vía (misma Y) dentro de un rango de vista
-function car_ahead(agent, model; lookahead::Float64 = 3.0, lane_tol::Float64 = 0.01)
-    ahead = nothing
-    min_dx = Inf
-    for nb in nearby_agents(agent, model, lookahead)
-        # misma vía (Y casi igual)
-        if abs(nb.pos[2] - agent.pos[2]) <= lane_tol
-            dx = nb.pos[1] - agent.pos[1]  # diferencia en X
-            if dx > 0 && dx < min_dx
-                ahead = nb
-                min_dx = dx
-            end
+light_state(l::TrafficLight)::Symbol = begin
+    t = mod(l.tick, CYCLE)
+    if t < G_T
+        :green
+    elseif t < G_T + Y_T
+        :yellow
+    else
+        :red
+    end
+end
+
+function agent_step!(l::TrafficLight, model)
+    l.tick = mod(l.tick + 1, CYCLE)
+    l.vel = SVector{2, Float64}(0.0, 0.0)
+end
+
+function light_ew(model)
+    for a in allagents(model)
+        if a isa TrafficLight && a.dir === :EW
+            return a
         end
     end
-    return ahead
+    return nothing
 end
 
-function agent_step!(agent, model)
-    # Si hay un auto por delante en la misma vía -> desacelera, si no -> acelera
-    new_velocity = isnothing(car_ahead(agent, model)) ? accelerate(agent) : decelerate(agent)
+function random_x_outside(rng::AbstractRNG, xmin::Float64, xmax::Float64, a::Float64, b::Float64)
+    a = clamp(a, xmin, xmax)
+    b = clamp(b, xmin, xmax)
+    left_len  = max(0.0, a - xmin)
+    right_len = max(0.0, xmax - b)
+    if left_len + right_len == 0
+        return xmin + 0.1
+    end
+    if rand(rng) < left_len / (left_len + right_len)
+        return xmin + rand(rng) * left_len
+    else
+        return b + rand(rng) * right_len
+    end
+end
 
-    # Saturación en [0, 1]
-    if new_velocity > 1.0
-        new_velocity = 1.0
-    elseif new_velocity < 0.0
-        new_velocity = 0.0
+function agent_step!(c::Vehicle, model)
+    cx = model.cx
+    stop_x = model.stop_x
+
+    dt = DT
+    desired = c.target_speed
+
+    # Estado del semáforo de la vía horizontal
+    lew = light_ew(model)
+    st  = isnothing(lew) ? :green : light_state(lew)
+
+    x = c.pos[1]
+    dist = stop_x - x  
+
+    if (st != :green) && dist > 0
+        if dist <= desired * dt
+            v = max(0.0, dist / dt - 1e-6)
+            c.vel = SVector{2,Float64}(v, 0.0)
+        else
+            c.vel = SVector{2,Float64}(desired, 0.0)
+        end
+    else
+        c.vel = SVector{2,Float64}(desired, 0.0)
     end
 
-    # Actualiza vector de velocidad (horizontal)
-    agent.vel = SVector{2, Float64}(new_velocity, 0.0)
-
-    # Avanza (dt = 0.4)
-    move_agent!(agent, model, 0.4)
+    move_agent!(c, model, dt)
 end
 
-function initialize_model(extent = (25, 10))
+function initialize_model(extent = (25, 25))
     space2d = ContinuousSpace(extent; spacing = 0.5, periodic = true)
     rng = Random.MersenneTwister()
 
-    model = StandardABM(Car, space2d; rng, agent_step!, scheduler = Schedulers.Randomly())
+    cx, cy = extent[1] / 2, extent[2] / 2
+    stop_x = cx - CROSS_HALF - STOP_MARGIN
 
-    y_lane = 1.0  # <-- local, NO const
-    first = true
-    for px in randperm(rng, 25)[1:5]
-        speed = first ? 1.0 : rand(rng, Uniform(0.2, 0.7))
-        add_agent!(
-            SVector{2, Float64}(px, y_lane),
-            model;
-            vel = SVector{2, Float64}(speed, 0.0),
-            accelerating = true
-        )
-        first = false
-    end
+    model = StandardABM(Union{TrafficLight, Vehicle}, space2d;
+        rng,
+        properties = Dict(:cx => cx, :cy => cy, :stop_x => stop_x),
+        agent_step!,
+        scheduler = Schedulers.ByType((TrafficLight, Vehicle), false)
+    )
+
+    add_agent!(SVector{2,Float64}(cx - 0.5, cy), TrafficLight, model;
+        vel  = SVector{2,Float64}(0.0, 0.0), dir = :EW, tick = 0)
+
+    add_agent!(SVector{2,Float64}(cx, cy - 0.5), TrafficLight, model;
+        vel  = SVector{2,Float64}(0.0, 0.0), dir = :NS, tick = 14)
+
+    ex_a = cx - CROSS_HALF - 0.5
+    ex_b = cx + CROSS_HALF + 0.5
+    spawn_x = random_x_outside(rng, 0.5, extent[1]-0.5, ex_a, ex_b)
+    add_agent!(SVector{2,Float64}(spawn_x, cy), Vehicle, model;
+        vel = SVector{2,Float64}(0.8, 0.0), target_speed = 0.8)
 
     return model
 end
